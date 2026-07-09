@@ -1,0 +1,3 @@
+scripts:
+  - ~/.mitmproxy/ai_addon.py
+  - ~/.mitmproxy/flow_diff.py
