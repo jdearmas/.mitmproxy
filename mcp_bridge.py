@@ -14,6 +14,10 @@ control API (http://127.0.0.1:8081 by default). Add to Claude Code settings:
   }
 }
 
+The control API is authenticated. This bridge reads the bearer token from
+$MITMPROXY_CONTROL_TOKEN, else from ~/.mitmproxy/control_token, which the
+addon creates 0600 on first start.
+
 Requires: pip install mcp httpx
 """
 
@@ -23,16 +27,46 @@ import sys
 import httpx
 
 CONTROL_URL = os.environ.get("MITMPROXY_CONTROL_URL", "http://127.0.0.1:8081")
+TOKEN_PATH = os.environ.get(
+    "MITMPROXY_CONTROL_TOKEN_FILE", os.path.expanduser("~/.mitmproxy/control_token")
+)
 
 # MCP protocol over stdio — minimal implementation
 # Handles initialize, tools/list, tools/call
 
 
+def _auth_token():
+    token = os.environ.get("MITMPROXY_CONTROL_TOKEN", "").strip()
+    if token:
+        return token
+    try:
+        with open(TOKEN_PATH, "r") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
 def _http(method, path, **kwargs):
     """Synchronous HTTP call to the control server."""
+    token = _auth_token()
+    if not token:
+        return {
+            "error": (
+                f"No control token. Expected {TOKEN_PATH} (created by the addon on "
+                "first start) or $MITMPROXY_CONTROL_TOKEN. Is mitmproxy running?"
+            )
+        }
     url = f"{CONTROL_URL}{path}"
+    headers = {**kwargs.pop("headers", {}), "Authorization": f"Bearer {token}"}
     try:
-        resp = httpx.request(method, url, timeout=120, **kwargs)
+        resp = httpx.request(method, url, timeout=120, headers=headers, **kwargs)
+        if resp.status_code in (401, 403):
+            return {
+                "error": (
+                    f"Control API rejected the token ({resp.status_code}). "
+                    f"The addon may have regenerated {TOKEN_PATH}."
+                )
+            }
         return resp.json()
     except httpx.ConnectError:
         return {"error": f"Cannot connect to mitmproxy control API at {CONTROL_URL}. Is mitmproxy running with the AI addon?"}

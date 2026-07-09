@@ -22,11 +22,14 @@ Commands:
 import ast
 import asyncio
 import concurrent.futures
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
+import stat
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 from typing import Optional
@@ -35,6 +38,13 @@ from urllib.parse import urlparse, parse_qs
 from mitmproxy import command, ctx, http
 
 logger = logging.getLogger("mitmproxy.ai")
+
+TOKEN_PATH = os.path.expanduser("~/.mitmproxy/control_token")
+
+# Host headers accepted by the control API. Anything else is treated as a
+# DNS-rebinding attempt: an attacker who points evil.com at 127.0.0.1 still
+# cannot forge one of these values.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 ADDON_SYSTEM_PROMPT = """You are an expert mitmproxy addon developer. Write a Python addon class
 called DynamicAddon that implements the described behaviour using mitmproxy hooks.
@@ -76,6 +86,54 @@ PROMPT_SYSTEM = """You are an AI assistant embedded in the mitmproxy interceptin
 You can see the user's current traffic context (focused flow details).
 Answer questions about HTTP traffic, suggest security findings, explain API behavior.
 Be concise — your response will be displayed in a terminal overlay."""
+
+
+def _load_or_create_token(path: str = TOKEN_PATH) -> str:
+    """Return the control API bearer token, generating it on first use.
+
+    The token file is the security boundary: it is created 0600 so only this
+    user can read it. An existing file is reused so that relaunching mitmproxy
+    does not invalidate already-configured clients.
+    """
+    try:
+        with open(path, "r") as fh:
+            token = fh.read().strip()
+        if token:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+            if mode & 0o077:
+                os.chmod(path, 0o600)
+                logger.warning(f"[AI] Tightened permissions on {path} (was {mode:#o}).")
+            return token
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        raise RuntimeError(f"Cannot read control token at {path}: {e}") from e
+
+    token = secrets.token_urlsafe(32)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, (token + "\n").encode())
+    finally:
+        os.close(fd)
+    return token
+
+
+def _host_is_loopback(host_header: str, port: int) -> bool:
+    """True if a Host header names this loopback listener and nothing else."""
+    host = (host_header or "").strip()
+    if not host:
+        return False
+    if host.startswith("["):  # bracketed IPv6, e.g. [::1]:8081
+        end = host.find("]")
+        if end == -1:
+            return False
+        hostname, portpart = host[1:end], host[end + 1:]
+    else:
+        hostname, sep, tail = host.partition(":")
+        portpart = f":{tail}" if sep else ""
+    if portpart and portpart != f":{port}":
+        return False
+    return hostname.lower() in _LOOPBACK_HOSTS
 
 
 def _create_client(provider: str, base_url: str, api_key: str):
@@ -182,7 +240,22 @@ def _flow_to_dict(f, body_limit=2000):
 
 
 class _ControlHandler(BaseHTTPRequestHandler):
-    """Request handler for the control API. Runs in a background thread."""
+    """Request handler for the control API. Runs in a background thread.
+
+    POST /addon executes caller-supplied Python, so every request is
+    authenticated. Three checks, all of which a web page must fail:
+
+      * Host must name the loopback listener   — defeats DNS rebinding.
+      * Origin must be absent                  — browsers always attach it
+                                                 cross-site; real clients never do.
+      * Authorization: Bearer <token>          — an unlisted header, so a browser
+                                                 must preflight, and we answer no
+                                                 preflight and emit no CORS headers.
+    """
+
+    # Never advertise the Python/BaseHTTP version to callers.
+    server_version = "mitmproxy-ai"
+    sys_version = ""
 
     def log_message(self, format, *args):
         pass
@@ -192,8 +265,32 @@ class _ControlHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
+
+    def _authorized(self) -> bool:
+        """Gate every request. On failure, respond and return False."""
+        if not _host_is_loopback(self.headers.get("Host", ""), self.server.server_port):
+            self._json_response({"error": "forbidden"}, 403)
+            return False
+
+        if self.headers.get("Origin") is not None:
+            self._json_response({"error": "forbidden"}, 403)
+            return False
+
+        scheme, _, presented = self.headers.get("Authorization", "").partition(" ")
+        expected = self.server.auth_token
+        if scheme.lower() != "bearer" or not hmac.compare_digest(presented.strip(), expected):
+            self._json_response({"error": "unauthorized"}, 401)
+            return False
+
+        return True
+
+    def do_OPTIONS(self):
+        # Answer no CORS preflight. Without this a browser could be told the
+        # Authorization header is permitted cross-origin.
+        self._json_response({"error": "method not allowed"}, 405)
 
     def _read_json(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -206,6 +303,8 @@ class _ControlHandler(BaseHTTPRequestHandler):
         return parsed.path, parse_qs(parsed.query)
 
     def do_GET(self):
+        if not self._authorized():
+            return
         path, qs = self._parse_path()
         addon = self.server.ai_addon
 
@@ -291,6 +390,8 @@ class _ControlHandler(BaseHTTPRequestHandler):
             self._json_response({"error": "not found"}, 404)
 
     def do_POST(self):
+        if not self._authorized():
+            return
         path, _ = self._parse_path()
         addon = self.server.ai_addon
 
@@ -335,6 +436,8 @@ class _ControlHandler(BaseHTTPRequestHandler):
             self._json_response({"error": "not found"}, 404)
 
     def do_DELETE(self):
+        if not self._authorized():
+            return
         path, _ = self._parse_path()
         addon = self.server.ai_addon
 
@@ -348,7 +451,10 @@ class _ControlHandler(BaseHTTPRequestHandler):
 
 class ControlServer:
     """HTTP API exposing the live mitmproxy session to external tools (Claude Code).
-    Uses stdlib http.server in a background thread — zero external dependencies."""
+    Uses stdlib http.server in a background thread — zero external dependencies.
+
+    Bound to loopback and authenticated with a bearer token, because POST /addon
+    executes arbitrary Python in the mitmproxy process."""
 
     def __init__(self, ai_addon):
         self.ai_addon = ai_addon
@@ -356,11 +462,14 @@ class ControlServer:
         self._thread = None
 
     def start(self, port):
+        token = _load_or_create_token()
         self._server = HTTPServer(("127.0.0.1", port), _ControlHandler)
         self._server.ai_addon = self.ai_addon
+        self._server.auth_token = token
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         ctx.log.info(f"[AI] Control server listening on http://127.0.0.1:{port}")
+        ctx.log.info(f"[AI] Control token: {TOKEN_PATH} (clients read it from there)")
 
     def stop(self):
         if self._server:
@@ -592,6 +701,10 @@ class AIAddon:
             "Connect Claude Code to this mitmproxy session:",
             "",
             f"  Control API: http://127.0.0.1:{ctl_port}",
+            f"  Auth token:  {TOKEN_PATH} (mode 0600)",
+            "",
+            "  The bridge reads the token file automatically. To call the API",
+            "  by hand, send: Authorization: Bearer $(cat ~/.mitmproxy/control_token)",
             "",
             "  Add this MCP server to Claude Code settings:",
             "  {",

@@ -13,3 +13,6 @@ __pycache__/
 # Captured traffic — holds raw request/response headers and bodies
 *.db
 *.flows
+
+# Control API bearer token
+control_token
