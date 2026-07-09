@@ -1,0 +1,15 @@
+# CA certs and keys
+mitmproxy-ca.pem
+mitmproxy-ca.p12
+mitmproxy-ca-cert.pem
+mitmproxy-ca-cert.cer
+mitmproxy-ca-cert.p12
+mitmproxy-dhparam.pem
+
+# Runtime state
+command_history
+__pycache__/
+
+# Captured traffic — holds raw request/response headers and bodies
+*.db
+*.flows
