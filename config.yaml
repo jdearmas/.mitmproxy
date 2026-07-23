@@ -1,3 +1,8 @@
 scripts:
   - ~/.mitmproxy/ai_addon.py
   - ~/.mitmproxy/flow_diff.py
+  - ~/.mitmproxy/scope.py
+
+# Show newest flow at the top and follow new flows as they arrive
+view_order_reversed: true
+console_focus_follow: true
